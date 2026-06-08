@@ -21,6 +21,8 @@ use sweet_core::{
 };
 
 use crate::error::ProviderError;
+use crate::schema::sanitize_schema;
+use crate::util::provider_error_from_core;
 
 mod wire;
 
@@ -142,7 +144,7 @@ impl GeminiProvider {
                     .iter()
                     .map(|t| {
                         let mut params = t.parameters_schema.clone();
-                        wire::sanitize_schema(&mut params);
+                        sanitize_schema(&mut params);
                         wire::FunctionDeclaration {
                             name: &t.name,
                             description: &t.description,
@@ -265,34 +267,9 @@ impl GeminiProvider {
             let bytes = chunk?;
             buffer.extend_from_slice(&bytes);
 
-            while let Some(end) = crate::sse::find_event_end(&buffer) {
-                let event_bytes: Vec<u8> = buffer.drain(..end).collect();
-                let trim_len = event_bytes
-                    .iter()
-                    .rev()
-                    .take_while(|&&b| b == b'\r' || b == b'\n')
-                    .count();
-                let event_text = std::str::from_utf8(&event_bytes[..event_bytes.len() - trim_len])
-                    .map_err(|e| {
-                        ProviderError::Decode(serde::de::Error::custom(format!(
-                            "non-utf8 SSE event: {e}"
-                        )))
-                    })?;
-
-                let mut data_line: Option<&str> = None;
-                for line in event_text.lines() {
-                    if let Some(data) = line
-                        .strip_prefix("data: ")
-                        .or_else(|| line.strip_prefix("data:"))
-                    {
-                        let data = data.trim_start();
-                        if !data.is_empty() {
-                            data_line = Some(data);
-                        }
-                    }
-                }
-
-                let Some(data) = data_line else {
+            while let Some(result) = crate::sse::drain_event(&mut buffer) {
+                let event_text = result?;
+                let Some(data) = crate::sse::data_lines(&event_text).next() else {
                     continue;
                 };
 
@@ -386,10 +363,6 @@ impl Model for GeminiProvider {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn provider_error_from_core(err: sweet_core::Error) -> ProviderError {
-    ProviderError::Decode(serde::de::Error::custom(err.to_string()))
-}
 
 #[cfg(test)]
 mod tests {

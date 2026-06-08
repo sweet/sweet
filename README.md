@@ -24,29 +24,30 @@ Add `sweet-core`, `sweet-agent`, and a provider crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sweet-core = { git = "https://github.com/sweet/sweet", branch = "main" }
-sweet-agent = { git = "https://github.com/sweet/sweet", branch = "main" }
-sweet-llm = { git = "https://github.com/sweet/sweet", branch = "main" }
+sweet-core = { git = "https://github.com/sweet/sweet", branch = "master" }
+sweet-agent = { git = "https://github.com/sweet/sweet", branch = "master" }
+sweet-llm = { git = "https://github.com/sweet/sweet", branch = "master" }
 ```
 
 Build and run an agent:
 
 ```rust
-use sweet_agent::{Agent, AgentIo, run};
-use sweet_core::{InMemorySession, NoopSink};
+use sweet_agent::{Agent, TurnResult};
 use sweet_llm::OpenAIProvider;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let model = OpenAIProvider::from_env()?
         .with_model("gpt-4o");
-    let session = InMemorySession::new();
-    let agent = Agent::new(model)
-        .with_system("You are a helpful assistant.");
+    let mut agent = Agent::new(model)
+        .with_instructions("You are a helpful assistant.");
 
-    // drive one turn
-    let reply = agent.step("Hello!", &mut session, &mut NoopSink).await?;
-    println!("{}", reply.text());
+    // drive one turn (non-streaming)
+    let reply = match agent.step("Hello!").await? {
+        TurnResult::Message(msg) => msg,
+        TurnResult::Handoff { .. } => unreachable!(),
+    };
+    println!("{}", reply.text_content());
     Ok(())
 }
 ```

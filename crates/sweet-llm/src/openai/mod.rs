@@ -10,6 +10,8 @@ use sweet_core::stream::StreamSink;
 use sweet_core::{Message, Model, Result, ToolSpec, SWEET_VERSION};
 
 use crate::error::ProviderError;
+use crate::schema::sanitize_schema;
+use crate::util::{elapsed_ms, json_string, provider_error_from_core};
 
 mod reasoning;
 pub use reasoning::ReasoningContent;
@@ -24,42 +26,6 @@ pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
 pub const DEFAULT_MODEL: &str = "gpt-4o-mini";
 
-/// Strip schemars-specific fields that some providers (e.g. Baidu via
-/// OpenRouter) reject.
-///
-/// - Removes `$schema` and `title`.
-/// - Converts `type` arrays (e.g. `["string", "null"]` for `Option<T>`)
-///   into a single string, dropping `null`.
-fn sanitize_schema(schema: &mut serde_json::Value) {
-    if let Some(obj) = schema.as_object_mut() {
-        obj.remove("$schema");
-        obj.remove("title");
-
-        if let Some(type_val) = obj.get_mut("type") {
-            if let Some(arr) = type_val.as_array() {
-                let chosen = arr
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .find(|s| *s != "null")
-                    .unwrap_or("string");
-                *type_val = serde_json::Value::String(chosen.into());
-            }
-        }
-
-        for value in obj.values_mut() {
-            sanitize_schema(value);
-        }
-    } else if let Some(arr) = schema.as_array_mut() {
-        for item in arr {
-            sanitize_schema(item);
-        }
-    }
-}
-
-/// Inference provider for OpenAI's `/v1/chat/completions` API.
-///
-/// Compatible with any OpenAI-protocol endpoint (Cerebras, local llama
-/// servers, etc.) — point [`OpenAIProvider::with_base_url`] at the right URL.
 #[derive(Debug, Clone)]
 pub struct OpenAIProvider {
     http: reqwest::Client,
@@ -499,30 +465,9 @@ impl OpenAIProvider {
         while let Some(chunk) = stream.next().await {
             let bytes = chunk?;
             buffer.extend_from_slice(&bytes);
-            while let Some(end) = crate::sse::find_event_end(&buffer) {
-                let event_bytes: Vec<u8> = buffer.drain(..end).collect();
-                let trim_len = event_bytes
-                    .iter()
-                    .rev()
-                    .take_while(|&&b| b == b'\r' || b == b'\n')
-                    .count();
-                let event_text = std::str::from_utf8(&event_bytes[..event_bytes.len() - trim_len])
-                    .map_err(|e| {
-                        ProviderError::Decode(serde::de::Error::custom(format!(
-                            "non-utf8 SSE event: {e}"
-                        )))
-                    })?;
-                for line in event_text.lines() {
-                    let Some(data) = line
-                        .strip_prefix("data: ")
-                        .or_else(|| line.strip_prefix("data:"))
-                    else {
-                        continue;
-                    };
-                    let data = data.trim_start();
-                    if data.is_empty() {
-                        continue;
-                    }
+            while let Some(result) = crate::sse::drain_event(&mut buffer) {
+                let event_text = result?;
+                for data in crate::sse::data_lines(&event_text) {
                     if data == "[DONE]" {
                         done = true;
                         break;
@@ -651,20 +596,6 @@ struct ToolCallAccum {
     id: String,
     name: String,
     arguments: String,
-}
-
-fn provider_error_from_core(err: sweet_core::Error) -> ProviderError {
-    // The sink only fails if the IO layer does — surface the message.
-    ProviderError::Decode(serde::de::Error::custom(err.to_string()))
-}
-
-fn json_string<T: serde::Serialize + ?Sized>(value: &T) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|e| format!("observability serialization failed: {e}"))
-}
-
-fn elapsed_ms(started: Instant) -> u64 {
-    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

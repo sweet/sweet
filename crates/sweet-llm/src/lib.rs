@@ -35,4 +35,8 @@ mod error;
 pub use error::ProviderError;
 
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+mod schema;
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 mod sse;
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+mod util;

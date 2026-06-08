@@ -143,39 +143,6 @@ pub(crate) struct UsageMetadata {
 // Schema sanitization
 // ---------------------------------------------------------------------------
 
-/// Strip schemars-specific fields that Gemini's protobuf-based API rejects.
-///
-/// - Removes `$schema` and `title` from the root.
-/// - Converts `type` arrays (e.g. `["integer", "null"]` for `Option<T>`)
-///   into a single string, dropping `null`.
-pub(crate) fn sanitize_schema(schema: &mut serde_json::Value) {
-    if let Some(obj) = schema.as_object_mut() {
-        obj.remove("$schema");
-        obj.remove("title");
-
-        if let Some(type_val) = obj.get_mut("type") {
-            if let Some(arr) = type_val.as_array() {
-                // Pick the first non-null type.
-                let chosen = arr
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .find(|s| *s != "null")
-                    .unwrap_or("string");
-                *type_val = serde_json::Value::String(chosen.into());
-            }
-        }
-
-        // Recurse into every object value so nested properties are cleaned.
-        for value in obj.values_mut() {
-            sanitize_schema(value);
-        }
-    } else if let Some(arr) = schema.as_array_mut() {
-        for item in arr {
-            sanitize_schema(item);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Conversion helpers
 // ---------------------------------------------------------------------------
@@ -425,50 +392,6 @@ pub(crate) fn parse_response(
 mod tests {
     use super::*;
     use sweet_core::{ContentBlock, Message, ToolCall};
-
-    #[test]
-    fn removes_schema_and_title() {
-        let mut v = serde_json::json!({
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "title": "Foo",
-            "type": "object",
-        });
-        sanitize_schema(&mut v);
-        assert!(v.as_object().unwrap().get("$schema").is_none());
-        assert!(v.as_object().unwrap().get("title").is_none());
-    }
-
-    #[test]
-    fn collapses_type_array() {
-        let mut v = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "age": { "type": ["integer", "null"] }
-            }
-        });
-        sanitize_schema(&mut v);
-        assert_eq!(v["properties"]["age"]["type"], "integer");
-    }
-
-    #[test]
-    fn recurses_into_nested_properties() {
-        let mut v = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "nested": {
-                    "type": "object",
-                    "properties": {
-                        "val": { "type": ["string", "null"] }
-                    }
-                }
-            }
-        });
-        sanitize_schema(&mut v);
-        assert_eq!(
-            v["properties"]["nested"]["properties"]["val"]["type"],
-            "string"
-        );
-    }
 
     // ---------------------------------------------------------------------
     // convert_messages — the Gemini wire format requires tool-result content

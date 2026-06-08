@@ -218,7 +218,7 @@ impl SharedSessionHandle {
     pub fn snapshot_messages(&self) -> Vec<Message> {
         self.snapshot
             .lock()
-            .expect("shared session snapshot poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
@@ -226,16 +226,13 @@ impl SharedSessionHandle {
     fn append(&self, message: Message) {
         self.snapshot
             .lock()
-            .expect("shared session snapshot poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(message);
     }
 
     /// Replace the entire snapshot. Used for clear and replace_range.
     fn replace_all(&self, messages: Vec<Message>) {
-        *self
-            .snapshot
-            .lock()
-            .expect("shared session snapshot poisoned") = messages;
+        *self.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = messages;
     }
 }
 
