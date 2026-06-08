@@ -258,7 +258,7 @@ impl AnthropicProvider {
             buffer.extend_from_slice(&bytes);
             while let Some(result) = crate::sse::drain_event(&mut buffer) {
                 let event_text = result?;
-                let Some(data) = crate::sse::data_lines(&event_text).next() else {
+                let Some(data) = crate::sse::data_lines(&event_text).last() else {
                     continue;
                 };
 

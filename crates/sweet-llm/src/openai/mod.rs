@@ -26,6 +26,10 @@ pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
 pub const DEFAULT_MODEL: &str = "gpt-4o-mini";
 
+/// Inference provider for OpenAI's `/v1/chat/completions` API.
+///
+/// Compatible with any OpenAI-protocol endpoint (Cerebras, local llama
+/// servers, etc.) — point [`OpenAIProvider::with_base_url`] at the right URL.
 #[derive(Debug, Clone)]
 pub struct OpenAIProvider {
     http: reqwest::Client,
