@@ -376,7 +376,8 @@ impl Filesystem for DirectFs {
             if !path.is_file() {
                 continue;
             }
-            if !glob.is_match(path) && !glob.is_match(path.file_name().unwrap_or_default()) {
+            let relative = path.strip_prefix(base).unwrap_or(path);
+            if !glob.is_match(relative) && !glob.is_match(path.file_name().unwrap_or_default()) {
                 continue;
             }
             results.push(path.to_path_buf());
@@ -667,6 +668,21 @@ mod tests {
             .collect();
         assert!(names.contains(&"a.rs".to_string()));
         assert!(names.contains(&"c.rs".to_string()));
+    }
+
+    #[tokio::test]
+    async fn local_fs_walk_matches_directory_scoped_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = DirectFs;
+        fs.write(&dir.path().join("a.rs"), b"").await.unwrap();
+        fs.create_dir_all(&dir.path().join("sub")).await.unwrap();
+        fs.write(&dir.path().join("sub/c.rs"), b"").await.unwrap();
+
+        // A glob with a directory component matches against the path relative
+        // to `base`, so it selects only the nested file, not the top-level one.
+        let results = fs.walk("sub/*.rs", dir.path()).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].ends_with("sub/c.rs"));
     }
 
     #[tokio::test]
