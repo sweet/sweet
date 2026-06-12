@@ -35,8 +35,16 @@ fn ensure_vec_extension_loaded() {
         // function pointer through `*const ()` to
         // `Option<unsafe extern "C" fn(...)>` is the pattern documented in
         // the sqlite-vec README.
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
+        type AutoExtensionEntry = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *mut std::os::raw::c_char,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> std::os::raw::c_int;
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+            *const (),
+            AutoExtensionEntry,
+        >(
+            sqlite_vec::sqlite3_vec_init as *const ()
         )));
     });
 }
@@ -58,6 +66,9 @@ fn ensure_vec_extension_loaded() {
 pub struct SqliteVecMemory {
     conn: Mutex<Connection>,
     embedder: Option<Arc<dyn Embedder>>,
+    /// Dimensionality of the vec0 table; vectors of any other size are
+    /// rejected by sqlite-vec, so they degrade to keyword-only instead.
+    dims: usize,
 }
 
 impl std::fmt::Debug for SqliteVecMemory {
@@ -73,7 +84,9 @@ impl SqliteVecMemory {
     /// dimensionality. Pass `":memory:"` for a transient store.
     ///
     /// The dimensionality must match across reopens — it is validated against
-    /// the `_meta` table on subsequent opens.
+    /// the `_meta` table on subsequent opens. The attached embedder must
+    /// produce vectors of exactly this size; other sizes degrade to
+    /// keyword-only recall (see [`with_embedder`](Self::with_embedder)).
     pub fn open(
         path: impl AsRef<std::path::Path>,
         vector_dimensions: usize,
@@ -84,12 +97,14 @@ impl SqliteVecMemory {
         Ok(Self {
             conn: Mutex::new(conn),
             embedder: None,
+            dims: vector_dimensions,
         })
     }
 
     /// Attach an embedder; subsequent saves are embedded and searches add a
-    /// semantic ranking. Embedding failure during save degrades that record
-    /// to keyword-only recall rather than failing the save.
+    /// semantic ranking. Embedding failure during save — including vectors
+    /// whose size doesn't match the store's dimensionality — degrades that
+    /// record to keyword-only recall rather than failing the save.
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.embedder = Some(embedder);
         self
@@ -151,15 +166,33 @@ impl SqliteVecMemory {
     }
 
     /// Embed `text` if an embedder is attached; `None` (with a warning) when
-    /// embedding fails — memory durability beats vector coverage.
+    /// embedding fails or the vector doesn't match the store's
+    /// dimensionality — memory durability beats vector coverage.
     async fn try_embed(&self, text: &str) -> Option<Vec<f32>> {
         let embedder = self.embedder.as_ref()?;
         match embedder.embed(&[text.to_string()]).await {
-            Ok(mut vectors) => vectors.pop(),
+            Ok(mut vectors) => self.check_dims(vectors.pop()),
             Err(err) => {
                 tracing::warn!("embedding failed, saving keyword-only memory: {err}");
                 None
             }
+        }
+    }
+
+    /// `None` (with a warning) for a vector the vec0 table would reject.
+    fn check_dims(&self, vector: Option<Vec<f32>>) -> Option<Vec<f32>> {
+        match vector {
+            Some(v) if v.len() == self.dims => Some(v),
+            Some(v) => {
+                tracing::warn!(
+                    "embedder produced {} dimensions but the store expects {}; \
+                     degrading to keyword-only",
+                    v.len(),
+                    self.dims
+                );
+                None
+            }
+            None => None,
         }
     }
 
@@ -251,7 +284,9 @@ impl SqliteVecMemory {
             params![id.to_string()],
             |row| row.get(0),
         )
-        .map_err(MemoryError::storage)
+        .optional()
+        .map_err(MemoryError::storage)?
+        .ok_or_else(|| MemoryError::NotFound(id.to_string()))
     }
 }
 
@@ -277,8 +312,12 @@ impl Memory for SqliteVecMemory {
             updated_at: now,
         };
         let tags_json = serde_json::to_string(&record.tags).map_err(MemoryError::storage)?;
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute(
+        // One transaction: a memories row without its vec0 twin would be
+        // silently invisible to semantic search (and rowid reuse after a
+        // partial delete could attach an orphaned vector to the wrong row).
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction().map_err(MemoryError::storage)?;
+        tx.execute(
             "INSERT INTO memories
              (id, scope_kind, scope_key, content, tags, source_session,
               created_at, updated_at, embedding, embedding_model)
@@ -303,13 +342,14 @@ impl Memory for SqliteVecMemory {
 
         // Also insert into the vec0 virtual table if we have an embedding.
         if let Some(ref vec) = embedding {
-            let rowid = conn.last_insert_rowid();
-            conn.execute(
+            let rowid = tx.last_insert_rowid();
+            tx.execute(
                 "INSERT INTO memories_vec(rowid, embedding) VALUES (?1, ?2)",
                 params![rowid, vec_to_blob(vec)],
             )
             .map_err(MemoryError::storage)?;
         }
+        tx.commit().map_err(MemoryError::storage)?;
 
         Ok(record)
     }
@@ -350,17 +390,18 @@ impl Memory for SqliteVecMemory {
                 .collect());
         };
 
-        // Embed the query before any lock is taken.
+        // Embed the query before any lock is taken. A query vector the vec0
+        // table would reject degrades the search to keyword-only.
         let query_embedding = match &self.embedder {
-            Some(embedder) => Some((
-                embedder
+            Some(embedder) => {
+                let vector = embedder
                     .embed(&[text.to_string()])
                     .await
                     .map_err(|e| MemoryError::Embedding(e.into()))?
-                    .pop()
-                    .unwrap_or_default(),
-                embedder.id().to_string(),
-            )),
+                    .pop();
+                self.check_dims(vector)
+                    .map(|v| (v, embedder.id().to_string()))
+            }
             None => None,
         };
 
@@ -420,12 +461,13 @@ impl Memory for SqliteVecMemory {
         record.updated_at = unix_now();
         let tags_json = serde_json::to_string(&record.tags).map_err(MemoryError::storage)?;
 
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let rowid = Self::get_rowid(&conn, id)?;
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction().map_err(MemoryError::storage)?;
+        let rowid = Self::get_rowid(&tx, id)?;
 
         let updated = match new_embedding {
             Some(embedding) => {
-                let n = conn
+                let n = tx
                     .execute(
                         "UPDATE memories SET content = ?2, tags = ?3, updated_at = ?4,
                          embedding = ?5, embedding_model = ?6 WHERE id = ?1",
@@ -445,11 +487,11 @@ impl Memory for SqliteVecMemory {
 
                 // Update the vec0 table: delete old entry, insert new if we
                 // have an embedding.
-                conn.execute("DELETE FROM memories_vec WHERE rowid = ?1", params![rowid])
+                tx.execute("DELETE FROM memories_vec WHERE rowid = ?1", params![rowid])
                     .map_err(MemoryError::storage)?;
 
                 if let Some(ref vec) = embedding {
-                    conn.execute(
+                    tx.execute(
                         "INSERT INTO memories_vec(rowid, embedding) VALUES (?1, ?2)",
                         params![rowid, vec_to_blob(vec)],
                     )
@@ -457,7 +499,7 @@ impl Memory for SqliteVecMemory {
                 }
                 n
             }
-            None => conn
+            None => tx
                 .execute(
                     "UPDATE memories SET content = ?2, tags = ?3, updated_at = ?4 WHERE id = ?1",
                     params![id.to_string(), record.content, tags_json, record.updated_at],
@@ -467,14 +509,16 @@ impl Memory for SqliteVecMemory {
         if updated == 0 {
             return Err(MemoryError::NotFound(id.to_string()));
         }
+        tx.commit().map_err(MemoryError::storage)?;
         Ok(record)
     }
 
     async fn delete(&self, id: &MemoryId) -> Result<bool, MemoryError> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction().map_err(MemoryError::storage)?;
 
         // Get rowid before deleting from memories.
-        let rowid_result: Option<i64> = conn
+        let rowid_result: Option<i64> = tx
             .query_row(
                 "SELECT rowid FROM memories WHERE id = ?1",
                 params![id.to_string()],
@@ -487,17 +531,18 @@ impl Memory for SqliteVecMemory {
             return Ok(false);
         };
 
-        // Delete from vec0 first, then from memories (FTS5 trigger handles
-        // the FTS cleanup).
-        let _ = conn
-            .execute("DELETE FROM memories_vec WHERE rowid = ?1", params![rowid])
+        // Delete from vec0 and memories together (FTS5 trigger handles the
+        // FTS cleanup): a vec0 row outliving its memories row would attach
+        // to whatever record later reuses the rowid.
+        tx.execute("DELETE FROM memories_vec WHERE rowid = ?1", params![rowid])
             .map_err(MemoryError::storage)?;
-        let deleted = conn
+        let deleted = tx
             .execute(
                 "DELETE FROM memories WHERE id = ?1",
                 params![id.to_string()],
             )
             .map_err(MemoryError::storage)?;
+        tx.commit().map_err(MemoryError::storage)?;
         Ok(deleted > 0)
     }
 }

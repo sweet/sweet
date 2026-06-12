@@ -348,6 +348,9 @@ impl Session for SqliteSession {
             let tx = conn.transaction().map_err(SessionError::storage)?;
 
             for position in &self.positions[range.clone()] {
+                // Exact float equality is sound here: positions are written
+                // as SQLite REAL (8-byte IEEE), so the f64s in `positions`
+                // round-trip bit-for-bit through the database.
                 tx.execute(
                     "UPDATE items SET archived = 1
                      WHERE session_id = ?1 AND archived = 0 AND position = ?2",

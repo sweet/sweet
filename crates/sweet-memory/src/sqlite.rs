@@ -228,17 +228,15 @@ impl Memory for SqliteMemory {
                 .collect());
         };
 
-        // Embed the query before any lock is taken.
+        // Embed the query before any lock is taken. No query vector (an
+        // embedder returning nothing) skips the semantic pass.
         let query_embedding = match &self.embedder {
-            Some(embedder) => Some((
-                embedder
-                    .embed(&[text.to_string()])
-                    .await
-                    .map_err(|e| MemoryError::Embedding(e.into()))?
-                    .pop()
-                    .unwrap_or_default(),
-                embedder.id().to_string(),
-            )),
+            Some(embedder) => embedder
+                .embed(&[text.to_string()])
+                .await
+                .map_err(|e| MemoryError::Embedding(e.into()))?
+                .pop()
+                .map(|v| (v, embedder.id().to_string())),
             None => None,
         };
 

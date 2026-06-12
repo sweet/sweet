@@ -221,6 +221,48 @@ async fn hybrid_search_fuses_semantic_ranking() {
     assert!(hits[0].record.content.contains("hot"));
 }
 
+/// Always produces vectors of the wrong size for a `VEC_DIMS` store.
+struct WrongDimsEmbedder;
+
+#[async_trait]
+impl Embedder for WrongDimsEmbedder {
+    async fn embed(&self, texts: &[String]) -> CoreResult<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|_| vec![1.0; VEC_DIMS + 1]).collect())
+    }
+
+    fn id(&self) -> &str {
+        "fake/wrong-dims"
+    }
+}
+
+#[tokio::test]
+async fn wrong_dimension_vectors_degrade_to_keyword_only() {
+    let store = SqliteVecMemory::open(":memory:", VEC_DIMS)
+        .unwrap()
+        .with_embedder(Arc::new(WrongDimsEmbedder));
+
+    // Save must succeed despite the unusable vector...
+    let saved = store
+        .save(user_scope(), "the stove is hot", &[], None)
+        .await
+        .unwrap();
+
+    // ...search must not error on the unusable query vector, and keyword
+    // recall still finds the record.
+    let hits = store
+        .search(&MemoryQuery::new().with_text("stove"))
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].record.id, saved.id);
+
+    // Updates re-embed; the mismatch must not fail them either.
+    store
+        .update(&saved.id, Some("the stove is warm"), None)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn mismatched_embedder_rows_stay_keyword_searchable() {
     let dir = tempfile::tempdir().unwrap();

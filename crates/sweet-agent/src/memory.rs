@@ -358,8 +358,22 @@ impl MemoryDistiller {
                         tracing::warn!("distill produced invalid memory id: {id}");
                         continue;
                     };
-                    if let Err(err) = self.store.update(&id, Some(&item.content), None).await {
-                        tracing::warn!("distill update skipped: {err}");
+                    // The id is model-produced; only records in this
+                    // distiller's scope may be rewritten (mirroring
+                    // MemoryToolset's scope enforcement — recall can render
+                    // ids from other scopes into the model's context).
+                    match self.store.get(&id).await {
+                        Ok(Some(record)) if record.scope == self.scope => {
+                            if let Err(err) =
+                                self.store.update(&id, Some(&item.content), None).await
+                            {
+                                tracing::warn!("distill update skipped: {err}");
+                            }
+                        }
+                        Ok(_) => {
+                            tracing::warn!("distill update skipped: no memory {id} in scope");
+                        }
+                        Err(err) => tracing::warn!("distill update skipped: {err}"),
                     }
                 }
                 None => {
@@ -617,6 +631,28 @@ mod tests {
 
         let record = store.get(&saved.id).await.unwrap().unwrap();
         assert_eq!(record.content, "user deploys on Mondays now");
+    }
+
+    #[tokio::test]
+    async fn distill_refuses_updates_outside_its_scope() {
+        let store: Arc<dyn Memory> = Arc::new(EphemeralMemory::new());
+        let foreign = store
+            .save(
+                MemoryScope::User("someone-else".into()),
+                "their fact",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        let reply = format!(r#"[{{"id": "{}", "content": "tampered"}}]"#, foreign.id);
+        let model = MockModel::with_replies(["ok".to_string(), reply]);
+        let mut agent = distill_agent(model, store.clone(), 1);
+
+        agent.step("unrelated chatter").await.unwrap();
+
+        let record = store.get(&foreign.id).await.unwrap().unwrap();
+        assert_eq!(record.content, "their fact");
     }
 
     #[tokio::test]

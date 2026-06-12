@@ -134,13 +134,20 @@ The `Sandbox` trait bundles runner + fs together to prevent mixing. `OsSandbox` 
 
 ## Mandatory pre-commit checklist
 
+Run `./scripts/check.sh`, which mirrors CI (`.github/workflows/ci.yml`) exactly:
+
 ```bash
+export RUSTFLAGS=-Dwarnings RUSTDOCFLAGS=-Dwarnings
 cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features
+cargo check --workspace
 cargo build -p sweet-mcp-mock-server
-cargo test --workspace
+cargo test --workspace --all-features
 cargo doc --workspace --no-deps --all-features
 ```
+
+If you change one, change the other — drift between them is how "passes locally,
+fails CI" happens (feature-gated tests skipped, doc warnings not denied).
 
 ## Git hygiene
 
