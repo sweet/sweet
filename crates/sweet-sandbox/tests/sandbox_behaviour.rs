@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use sweet_core::sandbox::{Sandbox, SandboxPolicy};
-use sweet_sandbox::OsSandbox;
+use sweet_sandbox::{OsSandbox, SandboxRoots};
 use tempfile::TempDir;
 
 struct Harness {
@@ -23,9 +23,11 @@ struct Harness {
     project_root: PathBuf,
     outside_root: PathBuf,
     extra_read_root: PathBuf,
+    extra_write_root: PathBuf,
     _project: TempDir,
     _outside: TempDir,
     _extra_read: TempDir,
+    _extra_write: TempDir,
 }
 
 fn try_harness(policy: SandboxPolicy) -> Option<Harness> {
@@ -38,22 +40,29 @@ fn try_harness(policy: SandboxPolicy) -> Option<Harness> {
     let project = TempDir::new_in(&home).ok()?;
     let outside = TempDir::new_in(&home).ok()?;
     let extra_read = TempDir::new_in(&home).ok()?;
+    let extra_write = TempDir::new_in(&home).ok()?;
 
     let project_root = dunce::canonicalize(project.path()).ok()?;
     let outside_root = dunce::canonicalize(outside.path()).ok()?;
     let extra_read_root = dunce::canonicalize(extra_read.path()).ok()?;
+    let extra_write_root = dunce::canonicalize(extra_write.path()).ok()?;
 
     std::fs::write(project_root.join("inside.txt"), b"INSIDE_MARKER\n").ok()?;
     std::fs::write(outside_root.join("secret.txt"), b"OUTSIDE_SECRET\n").ok()?;
     std::fs::write(extra_read_root.join("config.toml"), b"EXTRA_READ_MARKER\n").ok()?;
+    std::fs::write(extra_write_root.join("cache.txt"), b"EXTRA_WRITE_MARKER\n").ok()?;
 
     // Grant read-only access to `extra_read_root` (the ancestor-`.cargo` case)
-    // but not `outside_root`, so the denial tests still exercise a truly
-    // out-of-bounds directory.
+    // and read+write access to `extra_write_root` (the `$CARGO_HOME` cache
+    // case), but nothing to `outside_root`, so the denial tests still exercise
+    // a truly out-of-bounds directory.
     let sandbox = OsSandbox::new(
         project_root.clone(),
         policy,
-        vec![extra_read_root.clone()],
+        SandboxRoots {
+            read: vec![extra_read_root.clone()],
+            write: vec![extra_write_root.clone()],
+        },
         Vec::new(),
     )
     .ok()?;
@@ -63,9 +72,11 @@ fn try_harness(policy: SandboxPolicy) -> Option<Harness> {
         project_root,
         outside_root,
         extra_read_root,
+        extra_write_root,
         _project: project,
         _outside: outside,
         _extra_read: extra_read,
+        _extra_write: extra_write,
     })
 }
 
@@ -209,7 +220,10 @@ async fn runner_reads_symlinked_extra_read_root() {
     let sandbox = match OsSandbox::new(
         project_root.clone(),
         SandboxPolicy::Sandbox,
-        vec![link.clone()],
+        SandboxRoots {
+            read: vec![link.clone()],
+            write: Vec::new(),
+        },
         Vec::new(),
     ) {
         Ok(s) => s,
@@ -358,6 +372,46 @@ async fn runner_denies_writes_to_extra_read_root() {
     );
 }
 
+#[tokio::test]
+async fn runner_writes_to_extra_write_root() {
+    // An extra write root (the `$CARGO_HOME` cache case) must be writable by a
+    // sandboxed command even though it sits under $HOME and outside the project
+    // root - this is what lets `cargo build` populate its registry cache.
+    let h = harness_or_skip!(SandboxPolicy::Sandbox);
+    let target = h.extra_write_root.join("new.txt");
+    let cmd = format!("echo WROTE > {} && cat {0}", target.to_string_lossy());
+    let out = h
+        .sandbox
+        .runner()
+        .run(&cmd, Some(&h.project_root), None)
+        .await
+        .unwrap();
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.stdout.trim(), "WROTE");
+    let host_view = std::fs::read_to_string(&target).unwrap();
+    assert_eq!(host_view.trim(), "WROTE");
+}
+
+#[tokio::test]
+async fn runner_reads_extra_write_root() {
+    // Write roots are folded into the read set, so a pre-existing file under an
+    // extra write root is readable too (cargo reads its cached crates back).
+    let h = harness_or_skip!(SandboxPolicy::Sandbox);
+    let cfg = h.extra_write_root.join("cache.txt");
+    let out = h
+        .sandbox
+        .runner()
+        .run(
+            &format!("cat {}", cfg.to_string_lossy()),
+            Some(&h.project_root),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.stdout.trim(), "EXTRA_WRITE_MARKER");
+}
+
 // ---------------------------------------------------------------------------
 // Runner: process exec
 // ---------------------------------------------------------------------------
@@ -487,9 +541,36 @@ async fn fs_reads_extra_read_root() {
 }
 
 #[tokio::test]
+async fn fs_reads_extra_write_root() {
+    // Write roots are folded into the read set, so the in-process filesystem
+    // reads back a pre-existing file under an extra write root - completing the
+    // matrix alongside `runner_reads_extra_write_root` and the fs write test.
+    let h = harness_or_skip!(SandboxPolicy::Sandbox);
+    let bytes = h
+        .sandbox
+        .fs()
+        .read(&h.extra_write_root.join("cache.txt"))
+        .await
+        .unwrap();
+    assert_eq!(bytes, b"EXTRA_WRITE_MARKER\n");
+}
+
+#[tokio::test]
 async fn fs_writes_inside_root() {
     let h = harness_or_skip!(SandboxPolicy::Sandbox);
     let path = h.project_root.join("written_via_fs.txt");
+    h.sandbox.fs().write(&path, b"hi").await.unwrap();
+    let host_view = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(host_view, "hi");
+}
+
+#[tokio::test]
+async fn fs_writes_to_extra_write_root() {
+    // The in-process filesystem must honor the same extra write root the command
+    // runner does (see `runner_writes_to_extra_write_root`) - the two layers
+    // agree on what is writable.
+    let h = harness_or_skip!(SandboxPolicy::Sandbox);
+    let path = h.extra_write_root.join("written_via_fs.txt");
     h.sandbox.fs().write(&path, b"hi").await.unwrap();
     let host_view = std::fs::read_to_string(&path).unwrap();
     assert_eq!(host_view, "hi");

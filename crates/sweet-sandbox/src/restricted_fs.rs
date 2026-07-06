@@ -43,10 +43,13 @@ const SYSTEM_READ_PATHS: &[&str] = &[
 /// A filesystem that restricts both read and write operations to a set of
 /// allowed directory roots.
 ///
-/// **Read roots**: system paths + tool paths (from `$PATH`) + the project root.
-/// No access to the user's home directory outside tool paths.
+/// **Read roots**: system paths, tool paths (from `$PATH`), every write root,
+/// and any extra read roots. No access to the user's home directory beyond
+/// those.
 ///
-/// **Write roots**: the project root only (plus `/tmp` via the OS runner).
+/// **Write roots**: the roots passed to [`new`](Self::new) - the project root
+/// plus any extra write roots (e.g. `$CARGO_HOME` for cargo's caches). Writes
+/// outside them are denied; every write root is readable too.
 ///
 /// All roots are canonicalized at construction time. Every read and write call
 /// is validated against the respective root set.
@@ -118,7 +121,8 @@ impl RestrictedFs {
     /// `extra_read_roots` (e.g. a directory holding session state outside the
     /// project root, which the agent must be able to read back even though the
     /// rest of the home directory is hidden). Writes stay limited to the
-    /// project root.
+    /// project root - to also grant *write* access beyond it (e.g. `$CARGO_HOME`)
+    /// use [`with_local_fs_and_reads_and_writes`](Self::with_local_fs_and_reads_and_writes).
     ///
     /// `extra_secret_dirs` lists home-relative directories (e.g. `".myapp"`)
     /// to keep out of the resolved tool roots, on top of the built-in
@@ -128,9 +132,35 @@ impl RestrictedFs {
         extra_read_roots: Vec<PathBuf>,
         extra_secret_dirs: Vec<String>,
     ) -> Self {
+        Self::with_local_fs_and_reads_and_writes(
+            project_root,
+            extra_read_roots,
+            Vec::new(),
+            extra_secret_dirs,
+        )
+    }
+
+    /// Like [`with_local_fs_and_reads`](Self::with_local_fs_and_reads) but also
+    /// grants write access to `extra_write_roots` on top of the project root.
+    /// The cargo registry/cache under `$CARGO_HOME` is the motivating case:
+    /// `cargo build` writes there, yet it lives outside the project root.
+    /// Write roots are folded into the read set by [`new`](Self::new), so a
+    /// write root is always also readable.
+    ///
+    /// Prefer this over the primitive [`new`](Self::new) when you want the same
+    /// readable tool paths (cargo, rustup, `$PATH`) the other convenience
+    /// constructors mount; `new` does not resolve those.
+    pub fn with_local_fs_and_reads_and_writes(
+        project_root: PathBuf,
+        extra_read_roots: Vec<PathBuf>,
+        extra_write_roots: Vec<PathBuf>,
+        extra_secret_dirs: Vec<String>,
+    ) -> Self {
         let mut read_roots = tool_paths::resolve_tool_roots(&extra_secret_dirs);
         read_roots.extend(extra_read_roots);
-        Self::new(Arc::new(DirectFs), vec![project_root], read_roots)
+        let mut write_roots = vec![project_root];
+        write_roots.extend(extra_write_roots);
+        Self::new(Arc::new(DirectFs), write_roots, read_roots)
     }
 
     /// Check whether `path` is readable (under a read root).

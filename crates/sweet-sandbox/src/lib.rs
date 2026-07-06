@@ -21,5 +21,5 @@ mod seatbelt;
 #[cfg(target_os = "linux")]
 mod bubblewrap;
 
-pub use os_sandbox::OsSandbox;
+pub use os_sandbox::{OsSandbox, SandboxRoots};
 pub use restricted_fs::RestrictedFs;

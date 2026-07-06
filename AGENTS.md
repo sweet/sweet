@@ -248,7 +248,7 @@ MCP tool provider backed by `rmcp` SDK (v1.7). Connects via stdio or Streamable 
 
 ### sweet-sandbox
 
-Public surface: `OsSandbox`, `RestrictedFs`.
+Public surface: `OsSandbox`, `SandboxRoots`, `RestrictedFs`.
 
 Feature flags:
 
