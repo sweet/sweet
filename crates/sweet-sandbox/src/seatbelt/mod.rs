@@ -43,6 +43,10 @@ const SYSTEM_READ_PATHS: &[&str] = &[
 pub struct SeatbeltRunner {
     /// Directories allowed for write access.
     allowed_write_roots: Vec<PathBuf>,
+    /// Directories allowed for reading only - never write or exec. Used for
+    /// paths the agent must read but not modify, e.g. an ancestor `.cargo`
+    /// dir cargo discovers by walking up from the project root.
+    extra_read_roots: Vec<PathBuf>,
     /// Tool directories resolved from `$PATH` and known locations.
     tool_roots: Vec<PathBuf>,
     /// Policy. Fixed at construction time - macOS SBPL cannot
@@ -55,12 +59,14 @@ pub struct SeatbeltRunner {
 impl SeatbeltRunner {
     pub fn new(
         allowed_write_roots: Vec<PathBuf>,
+        extra_read_roots: Vec<PathBuf>,
         policy: SandboxPolicy,
         extra_secret_dirs: Vec<String>,
     ) -> Self {
         let tool_roots = tool_paths::resolve_tool_roots(&extra_secret_dirs);
         Self {
             allowed_write_roots,
+            extra_read_roots,
             tool_roots,
             policy,
         }
@@ -105,6 +111,19 @@ impl SeatbeltRunner {
 
         // Allow reading tool paths (cargo, rustup, node, etc.)
         for root in &self.tool_roots {
+            if let Some(s) = root.to_str() {
+                rules.push(format!(
+                    "(allow file-read-data (subpath \"{}\"))",
+                    escape_sbpl(s)
+                ));
+            }
+        }
+
+        // Allow reading caller-supplied extra roots (read-only: no write, no
+        // exec). These sit outside the project root - e.g. an ancestor
+        // `.cargo` dir cargo discovers by walking up from the working dir, or
+        // session-state files the agent needs to read back.
+        for root in &self.extra_read_roots {
             if let Some(s) = root.to_str() {
                 rules.push(format!(
                     "(allow file-read-data (subpath \"{}\"))",
@@ -303,7 +322,7 @@ mod tests {
 
     fn runner_with_cwd() -> SeatbeltRunner {
         let cwd = std::env::current_dir().unwrap();
-        SeatbeltRunner::new(vec![cwd], SandboxPolicy::Sandbox, Vec::new())
+        SeatbeltRunner::new(vec![cwd], Vec::new(), SandboxPolicy::Sandbox, Vec::new())
     }
 
     #[tokio::test]
@@ -341,7 +360,7 @@ mod tests {
         // never use any of those forms.
         let cwd = std::env::current_dir().unwrap();
         for policy in [SandboxPolicy::Sandbox, SandboxPolicy::Restricted] {
-            let runner = SeatbeltRunner::new(vec![cwd.clone()], policy, Vec::new());
+            let runner = SeatbeltRunner::new(vec![cwd.clone()], Vec::new(), policy, Vec::new());
             let profile = runner.generate_profile();
             assert!(
                 !profile.contains("(host "),
@@ -402,7 +421,12 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let runner = SeatbeltRunner::new(vec![cwd.clone()], SandboxPolicy::Restricted, Vec::new());
+        let runner = SeatbeltRunner::new(
+            vec![cwd.clone()],
+            Vec::new(),
+            SandboxPolicy::Restricted,
+            Vec::new(),
+        );
         let out = runner
             .run(
                 "curl -sS --max-time 5 https://example.com -o /dev/null; echo exit=$?",
@@ -416,5 +440,81 @@ mod tests {
             "curl should fail when restricted; stdout: {:?}",
             out.stdout
         );
+    }
+
+    #[test]
+    fn extra_read_roots_emit_read_only_rules() {
+        // An extra read root must get a file-read-data allow, but never a
+        // write or exec rule - it is strictly read-only.
+        let cwd = std::env::current_dir().unwrap();
+        let extra = PathBuf::from("/some/ancestor/.cargo");
+        let runner = SeatbeltRunner::new(
+            vec![cwd],
+            vec![extra.clone()],
+            SandboxPolicy::Sandbox,
+            Vec::new(),
+        );
+        let profile = runner.generate_profile();
+        let p = extra.to_str().unwrap();
+        assert!(
+            profile.contains(&format!("(allow file-read-data (subpath \"{p}\"))")),
+            "extra read root must get a read-data allow:\n{profile}"
+        );
+        assert!(
+            !profile.contains(&format!("file-write* (subpath \"{p}\")")),
+            "extra read root must not be writable:\n{profile}"
+        );
+        assert!(
+            !profile.contains(&format!("(allow process-exec (subpath \"{p}\"))")),
+            "extra read root must not be executable:\n{profile}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_read_root_outside_project_is_readable() {
+        // A directory under $HOME that is not a tool root is hidden by default.
+        // Passing it as an extra read root must make its files readable by a
+        // sandboxed command (e.g. cargo reading an ancestor `.cargo/config.toml`),
+        // while an identical runner without it is still denied.
+        if is_nested_sandbox() {
+            eprintln!("skipping: sandbox-exec cannot nest inside an existing Seatbelt profile");
+            return;
+        }
+        let home = dirs::home_dir().expect("home directory not found");
+        let dir = home.join(format!(".sweet-sandbox-eread-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        std::fs::write(&file, "ok").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let cmd = format!("cat {}", file.display());
+
+        let denied = SeatbeltRunner::new(
+            vec![cwd.clone()],
+            Vec::new(),
+            SandboxPolicy::Sandbox,
+            Vec::new(),
+        );
+        let denied_out = denied.run(&cmd, None, None).await.unwrap();
+
+        let allowed = SeatbeltRunner::new(
+            vec![cwd],
+            vec![dir.clone()],
+            SandboxPolicy::Sandbox,
+            Vec::new(),
+        );
+        let allowed_out = allowed.run(&cmd, None, None).await.unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_ne!(
+            denied_out.exit_code, 0,
+            "a dir under $HOME must be denied without an extra read root"
+        );
+        assert_eq!(
+            allowed_out.exit_code, 0,
+            "extra read root should permit the read; stderr: {}",
+            allowed_out.stderr
+        );
+        assert_eq!(allowed_out.stdout.trim(), "ok");
     }
 }

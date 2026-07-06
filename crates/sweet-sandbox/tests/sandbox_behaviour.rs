@@ -22,34 +22,50 @@ struct Harness {
     sandbox: OsSandbox,
     project_root: PathBuf,
     outside_root: PathBuf,
+    extra_read_root: PathBuf,
     _project: TempDir,
     _outside: TempDir,
+    _extra_read: TempDir,
 }
 
 fn try_harness(policy: SandboxPolicy) -> Option<Harness> {
     let home = std::env::var("HOME").ok()?;
     let home = PathBuf::from(home);
 
-    // Place both trees under $HOME so they aren't in the system read-allow
+    // Place all trees under $HOME so they aren't in the system read-allow
     // list (`/tmp`, `/var/folders/...`) - that keeps "outside the project
     // root" actually outside any sandbox-permitted region on macOS.
     let project = TempDir::new_in(&home).ok()?;
     let outside = TempDir::new_in(&home).ok()?;
+    let extra_read = TempDir::new_in(&home).ok()?;
 
     let project_root = dunce::canonicalize(project.path()).ok()?;
     let outside_root = dunce::canonicalize(outside.path()).ok()?;
+    let extra_read_root = dunce::canonicalize(extra_read.path()).ok()?;
 
     std::fs::write(project_root.join("inside.txt"), b"INSIDE_MARKER\n").ok()?;
     std::fs::write(outside_root.join("secret.txt"), b"OUTSIDE_SECRET\n").ok()?;
+    std::fs::write(extra_read_root.join("config.toml"), b"EXTRA_READ_MARKER\n").ok()?;
 
-    let sandbox = OsSandbox::new(project_root.clone(), policy, Vec::new(), Vec::new()).ok()?;
+    // Grant read-only access to `extra_read_root` (the ancestor-`.cargo` case)
+    // but not `outside_root`, so the denial tests still exercise a truly
+    // out-of-bounds directory.
+    let sandbox = OsSandbox::new(
+        project_root.clone(),
+        policy,
+        vec![extra_read_root.clone()],
+        Vec::new(),
+    )
+    .ok()?;
 
     Some(Harness {
         sandbox,
         project_root,
         outside_root,
+        extra_read_root,
         _project: project,
         _outside: outside,
+        _extra_read: extra_read,
     })
 }
 
@@ -136,6 +152,86 @@ async fn runner_denies_reads_outside_project() {
         "file outside project must not be readable; output: {:?}",
         out.stdout
     );
+}
+
+#[tokio::test]
+async fn runner_reads_extra_read_root() {
+    // A directory passed as an extra read root - the ancestor-`.cargo` case -
+    // must be readable by a sandboxed command on every platform, even though it
+    // sits under $HOME and outside the project root.
+    let h = harness_or_skip!(SandboxPolicy::Sandbox);
+    let cfg = h.extra_read_root.join("config.toml");
+    let cmd = format!("cat {}", cfg.to_string_lossy());
+    let out = h
+        .sandbox
+        .runner()
+        .run(&cmd, Some(&h.project_root), None)
+        .await
+        .unwrap();
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.stdout.trim(), "EXTRA_READ_MARKER");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runner_reads_symlinked_extra_read_root() {
+    // Regression for the canonicalization in OsSandbox::new: an extra read root
+    // passed as a *symlink* must resolve to its real target so the runner's
+    // rule/bind matches the actual (canonical) file access. Without it, seatbelt
+    // would allow only the symlink's own subpath (no match for the resolved
+    // file) and bubblewrap would bind at the symlink path (the real dir stays
+    // hidden by the $HOME tmpfs) - either way the read would be denied.
+    let home = match std::env::var("HOME") {
+        Ok(h) => PathBuf::from(h),
+        Err(_) => {
+            eprintln!("skipping: no $HOME");
+            return;
+        }
+    };
+    // Real dir with the file, a symlink pointing at it, and a project root - all
+    // under $HOME so they sit outside every default read root.
+    let real = match TempDir::new_in(&home) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let real_root = dunce::canonicalize(real.path()).unwrap();
+    std::fs::write(real_root.join("config.toml"), b"SYMLINK_MARKER\n").unwrap();
+
+    let link_dir = TempDir::new_in(&home).unwrap();
+    // Only the final `root` component is a symlink; the parent stays canonical.
+    let link = dunce::canonicalize(link_dir.path()).unwrap().join("root");
+    std::os::unix::fs::symlink(&real_root, &link).unwrap();
+
+    let project = TempDir::new_in(&home).unwrap();
+    let project_root = dunce::canonicalize(project.path()).unwrap();
+
+    // Pass the *symlink* (non-canonical) as the extra read root.
+    let sandbox = match OsSandbox::new(
+        project_root.clone(),
+        SandboxPolicy::Sandbox,
+        vec![link.clone()],
+        Vec::new(),
+    ) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("skipping: OS sandbox unavailable");
+            return;
+        }
+    };
+
+    // Read through the *real* (resolved) path - what the kernel actually opens.
+    let cfg = real_root.join("config.toml");
+    let out = sandbox
+        .runner()
+        .run(&format!("cat {}", cfg.display()), Some(&project_root), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        out.exit_code, 0,
+        "a symlinked extra read root must resolve and be readable; stderr: {}",
+        out.stderr
+    );
+    assert_eq!(out.stdout.trim(), "SYMLINK_MARKER");
 }
 
 #[cfg(target_os = "macos")]
@@ -233,6 +329,32 @@ async fn runner_denies_writes_outside_project() {
     assert!(
         !host_view.contains("NEW_CONTENT"),
         "sandboxed write leaked outside project root: {host_view:?}"
+    );
+}
+
+#[tokio::test]
+async fn runner_denies_writes_to_extra_read_root() {
+    // Extra read roots are read-only by construction: readable (see
+    // `runner_reads_extra_read_root`) but never writable. A sandboxed write
+    // must not reach the host file.
+    let h = harness_or_skip!(SandboxPolicy::Sandbox);
+    let target = h.extra_read_root.join("config.toml");
+    let cmd = format!(
+        "echo NEW_CONTENT > {} 2>&1; echo END",
+        target.to_string_lossy()
+    );
+    let out = h
+        .sandbox
+        .runner()
+        .run(&cmd, Some(&h.project_root), None)
+        .await
+        .unwrap();
+    assert!(out.stdout.contains("END"));
+    let host_view = std::fs::read_to_string(&target).unwrap_or_default();
+    assert_eq!(
+        host_view.trim(),
+        "EXTRA_READ_MARKER",
+        "sandboxed write mutated a read-only extra root: {host_view:?}"
     );
 }
 
@@ -347,6 +469,21 @@ async fn fs_denies_reads_outside_root() {
         result.is_err(),
         "RestrictedFs::read outside project root must fail"
     );
+}
+
+#[tokio::test]
+async fn fs_reads_extra_read_root() {
+    // The in-process filesystem must honor the same extra read root the
+    // command runner does (see `runner_reads_extra_read_root`) - the two layers
+    // agree on what is readable.
+    let h = harness_or_skip!(SandboxPolicy::Sandbox);
+    let bytes = h
+        .sandbox
+        .fs()
+        .read(&h.extra_read_root.join("config.toml"))
+        .await
+        .unwrap();
+    assert_eq!(bytes, b"EXTRA_READ_MARKER\n");
 }
 
 #[tokio::test]

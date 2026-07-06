@@ -29,6 +29,10 @@ use crate::tool_paths;
 pub struct BubblewrapRunner {
     /// Directories allowed for write access (the project root).
     allowed_write_roots: Vec<PathBuf>,
+    /// Directories allowed for reading only - never write or exec. Used for
+    /// paths the agent must read but not modify, e.g. an ancestor `.cargo`
+    /// dir cargo discovers by walking up from the project root.
+    extra_read_roots: Vec<PathBuf>,
     /// Tool directories resolved from `$PATH` and known locations.
     tool_roots: Vec<PathBuf>,
     /// Policy. Fixed at construction time - bwrap toggles the whole
@@ -42,6 +46,7 @@ impl BubblewrapRunner {
     /// `$PATH` and returns an error with install instructions if not.
     pub fn new(
         allowed_write_roots: Vec<PathBuf>,
+        extra_read_roots: Vec<PathBuf>,
         policy: SandboxPolicy,
         extra_secret_dirs: Vec<String>,
     ) -> Result<Self, SandboxError> {
@@ -49,6 +54,7 @@ impl BubblewrapRunner {
         let tool_roots = tool_paths::resolve_tool_roots(&extra_secret_dirs);
         Ok(Self {
             allowed_write_roots,
+            extra_read_roots,
             tool_roots,
             policy,
         })
@@ -103,6 +109,20 @@ impl BubblewrapRunner {
         for file in tool_paths::resolve_safe_config_files() {
             if let Some(s) = file.to_str() {
                 if file.exists() {
+                    args.push("--ro-bind".to_string());
+                    args.push(s.to_string());
+                    args.push(s.to_string());
+                }
+            }
+        }
+
+        // Extra read-only roots (e.g. an ancestor `.cargo` dir cargo discovers
+        // by walking up from the working dir). Mounted read-only on top of the
+        // tmpfs, before the writable project bind so project writability wins
+        // on any overlap.
+        for root in &self.extra_read_roots {
+            if let Some(s) = root.to_str() {
+                if root.exists() {
                     args.push("--ro-bind".to_string());
                     args.push(s.to_string());
                     args.push(s.to_string());
